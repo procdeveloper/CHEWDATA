@@ -125,9 +125,15 @@ displays, not required to get started.
 ### Output
 
 Appends rows to `extracted_data.csv` (or `--output <path>`). **One number per
-column:** each field is its own column, and if a single field (e.g. the
-whole-panel default) reads several numbers they're split into `name_1`,
-`name_2`, … in reading order (top-to-bottom, left-to-right):
+column:** each field is its own column. If a single field (e.g. the
+whole-panel default) reads several numbers, they're split by their **position
+on the display** into stable cells — `name_r1c1`, `name_r1c2`, … for a grid of
+values, or `name_1`, `name_2`, … for a single row. Each value is assigned to
+the nearest column/row *center* (locked from the first frame with numbers), so
+a value never jumps columns just because OCR returned the tokens in a
+different order or momentarily missed one — a missed number simply leaves its
+own cell blank that row. (For guaranteed structure and your own labels, use
+`--grid` and name the cells.)
 
 ```
 timestamp_s,frame_idx,field1,field2

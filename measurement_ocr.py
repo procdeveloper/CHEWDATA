@@ -931,6 +931,83 @@ def field_columns(fields: List[Field]) -> Tuple[List[str], List[str]]:
     return names, values
 
 
+def _cluster_1d(vals: List[float], tol: float) -> List[float]:
+    """Greedy 1-D clustering of positions: values within `tol` of the running
+    cluster join it, otherwise a new cluster starts. Returns cluster centers,
+    sorted. Used to discover how many columns/rows a panel's numbers fall into
+    and where their centers are."""
+    if not vals:
+        return []
+    svals = sorted(vals)
+    clusters = [[svals[0]]]
+    for v in svals[1:]:
+        if v - clusters[-1][-1] <= tol:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    return [sum(c) / len(c) for c in clusters]
+
+
+def _nearest_idx(centers: List[float], v: float) -> int:
+    return min(range(len(centers)), key=lambda i: abs(centers[i] - v))
+
+
+def stable_columns(fields: List[Field], layout: dict) -> Tuple[List[str], List[str]]:
+    """Like field_columns, but assigns each recognized number to a FIXED
+    spatial cell instead of a reading-order rank, so values never swap columns
+    between frames (the failure that rank/reading-order splitting produces when
+    a box jitters across a row boundary or a token is momentarily dropped).
+
+    For a multi-number field the column/row centers are discovered once from
+    the first frame that has numbers and cached in `layout` (persisted in
+    log_state); every later frame maps each number to the nearest locked
+    column and row, and the full locked cell set is emitted each time so a
+    missing number just leaves its own cell blank -- it can't shift the others.
+    """
+    names: List[str] = []
+    values: List[str] = []
+    for f in fields:
+        toks, boxes = f.last_tokens, f.last_boxes
+        if len(toks) <= 1 or len(boxes) != len(toks):
+            names.append(f.name)
+            values.append(toks[0] if toks else f.last_text)
+            continue
+
+        cxs = [x + w / 2.0 for (x, _y, w, _h) in boxes]
+        cys = [y + h / 2.0 for (_x, y, _w, h) in boxes]
+        lay = layout.get(f.name)
+        if lay is None:
+            ws = sorted(w for (_x, _y, w, _h) in boxes)
+            hs = sorted(h for (_x, _y, _w, h) in boxes)
+            mw = ws[len(ws) // 2] or 1
+            mh = hs[len(hs) // 2] or 1
+            lay = {"cols": _cluster_1d(cxs, mw), "rows": _cluster_1d(cys, mh)}
+            layout[f.name] = lay
+        cols, rows = lay["cols"], lay["rows"]
+        if not cols:
+            names.append(f.name)
+            values.append(f.last_text)
+            continue
+        multi_row = len(rows) > 1
+
+        def cell_name(ri, ci):
+            return f"{f.name}_r{ri + 1}c{ci + 1}" if multi_row else f"{f.name}_{ci + 1}"
+
+        cells: dict = {}
+        for i, tok in enumerate(toks):
+            ci = _nearest_idx(cols, cxs[i])
+            ri = _nearest_idx(rows, cys[i]) if rows else 0
+            nm = cell_name(ri, ci)
+            # If two numbers land in the same cell (rare), keep them both.
+            cells[nm] = f"{cells[nm]} {tok}" if nm in cells else tok
+        for ri in range(len(rows) if rows else 1):
+            for ci in range(len(cols)):
+                nm = cell_name(ri, ci)
+                names.append(nm)
+                values.append(cells.get(nm, ""))
+    return names, values
+
+
 def _as_number(cell):
     """Coerce numeric-looking strings to real numbers so Excel treats them as
     values, not text. Non-numeric strings pass through; blanks become empty."""
@@ -1030,7 +1107,7 @@ def log_row(logger: RowLogger, fields: List[Field], cap, frame_idx: int,
     if not fields:
         print("No fields defined yet -- nothing to log.")
         return
-    names, values = field_columns(fields)
+    names, values = stable_columns(fields, log_state.setdefault("layout", {}))
 
     # Lock the column layout on the first row (or adopt the header of a file
     # we're appending to) so every later row lines up under the same columns.
@@ -1081,10 +1158,10 @@ def maybe_auto_log(ctx: dict) -> None:
     fields = ctx['fields']
     if not fields:
         return
-    names, values = field_columns(fields)
+    log_state = ctx['log_state']
+    names, values = stable_columns(fields, log_state.setdefault("layout", {}))
     if all(v is None or str(v).strip() == "" for v in values):
         return  # nothing recognized yet -- don't log a blank leading row
-    log_state = ctx['log_state']
     # Re-log if the readings changed OR the column layout changed.
     if values == log_state.get("last_values") and names == log_state.get("last_names"):
         return
@@ -1146,7 +1223,7 @@ def apply_action(action: str, ctx: dict) -> bool:
         log_row(ctx['logger'], ctx['fields'], ctx['cap'],
                  ctx['frame_idx'], ctx['log_state'])
         if had_fields:
-            names, values = field_columns(ctx['fields'])
+            names, values = stable_columns(ctx['fields'], ctx['log_state'].setdefault("layout", {}))
             summary = ", ".join(f"{n}={v or '?'}" for n, v in zip(names, values))
             ctx['flash_text'] = f"Logged: {summary}"
             ctx['flash_until'] = time.time() + 1.5

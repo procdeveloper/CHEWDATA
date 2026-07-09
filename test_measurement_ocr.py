@@ -128,6 +128,57 @@ class TestFieldColumns(unittest.TestCase):
         self.assertEqual(values, [""])
 
 
+class TestStableColumns(unittest.TestCase):
+    """A number must always land in the same column, whatever order OCR
+    returns the tokens in and even if some are dropped -- the regression that
+    caused values to swap columns between rows in the CSV."""
+
+    def _panel_field(self, tokens_boxes):
+        f = m.Field(name="d", rect=(0, 0, 300, 300))
+        f.last_tokens = [t for t, _b in tokens_boxes]
+        f.last_boxes = [b for _t, b in tokens_boxes]
+        return f
+
+    def test_multirow_maps_to_row_col_cells(self):
+        # 2 rows x 2 cols; boxes centered at (col*100, row*100)
+        f = self._panel_field([
+            ("a", (0, 0, 20, 20)), ("b", (100, 0, 20, 20)),
+            ("c", (0, 100, 20, 20)), ("d", (100, 100, 20, 20)),
+        ])
+        names, values = m.stable_columns([f], {})
+        self.assertEqual(names, ["d_r1c1", "d_r1c2", "d_r2c1", "d_r2c2"])
+        self.assertEqual(values, ["a", "b", "c", "d"])
+
+    def test_reordered_tokens_keep_their_columns(self):
+        cells = [("L1", (0, 0, 30, 20)), ("L2", (100, 0, 20, 20)),
+                 ("L3", (200, 0, 30, 20))]
+        layout = {}
+        base = dict(zip(*m.stable_columns([self._panel_field(cells)], layout)))
+        # same numbers, reversed detection order + small y jitter -> same layout
+        rev = [("L3", (200, 3, 30, 20)), ("L1", (0, -2, 30, 20)),
+               ("L2", (100, 2, 20, 20))]
+        names, values = m.stable_columns([self._panel_field(rev)], layout)
+        self.assertEqual(dict(zip(names, values)), base)
+
+    def test_dropped_token_blanks_only_its_own_cell(self):
+        cells = [("L1", (0, 0, 30, 20)), ("L2", (100, 0, 20, 20)),
+                 ("L3", (200, 0, 30, 20))]
+        layout = {}
+        m.stable_columns([self._panel_field(cells)], layout)   # lock 3 columns
+        # a frame that misses the middle value must NOT shift L3 into L2's slot
+        missing = [("L1", (0, 0, 30, 20)), ("L3", (200, 0, 30, 20))]
+        names, values = m.stable_columns([self._panel_field(missing)], layout)
+        d = dict(zip(names, values))
+        self.assertEqual(d["d_1"], "L1")
+        self.assertEqual(d["d_2"], "")     # middle blank
+        self.assertEqual(d["d_3"], "L3")   # stayed put
+
+    def test_single_value_field_unchanged(self):
+        f = m.Field(name="volts", rect=(0, 0, 10, 10),
+                    last_tokens=["12.3"], last_boxes=[(0, 0, 5, 5)])
+        self.assertEqual(m.stable_columns([f], {}), (["volts"], ["12.3"]))
+
+
 class TestLoggers(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
