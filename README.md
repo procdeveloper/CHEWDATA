@@ -124,7 +124,9 @@ displays, not required to get started.
 
 ### Output
 
-Appends rows to `extracted_data.csv` (or `--output <path>`). **One number per
+Appends rows to a new `data-<date>-<time>.csv` stamped with the time the run
+started (e.g. `data-2026-07-09-14-30-22.csv`), or to `--output <path>` if you
+give one. **One number per
 column:** each field is its own column. If a single field (e.g. the
 whole-panel default) reads several numbers, they're split by their **position
 on the display** into stable cells — `name_r1c1`, `name_r1c2`, … for a grid of

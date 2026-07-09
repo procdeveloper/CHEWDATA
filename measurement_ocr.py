@@ -85,6 +85,7 @@ import re
 import sys
 import time
 from collections import deque
+from datetime import datetime
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -1304,10 +1305,11 @@ def parse_args():
                     help="OCR backend (default: tesseract)")
     p.add_argument("--gpu", action="store_true",
                     help="Use GPU for the easyocr backend (ignored for tesseract)")
-    p.add_argument("--output", default="extracted_data.csv",
+    p.add_argument("--output", default=None,
                     help="File to append logged readings to. A .xlsx path writes an Excel "
-                         "workbook (needs openpyxl); any other extension writes CSV "
-                         "(default: extracted_data.csv)")
+                         "workbook (needs openpyxl); any other extension writes CSV. "
+                         "Default: a new data-<date>-<time>.csv stamped with the time this "
+                         "run started (e.g. data-2026-07-09-14-30-22.csv).")
     p.add_argument("--ocr-every", dest="ocr_every", type=int, default=5,
                     help="Run OCR every N frames while playing (default: 5)")
     p.add_argument("--upscale", type=float, default=3.0,
@@ -1362,6 +1364,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.output is None:
+        # Stamp the output with the time this harvest run started.
+        args.output = datetime.now().strftime("data-%Y-%m-%d-%H-%M-%S.csv")
     source = int(args.source) if args.source.isdigit() else args.source
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
