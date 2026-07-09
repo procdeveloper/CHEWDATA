@@ -1,0 +1,7 @@
+opencv-python>=4.8
+numpy>=1.24
+pytesseract>=0.3.10
+
+# Optional GPU-capable / alternative OCR backend (no external binary needed,
+# but pulls in PyTorch — heavier install). Enable with: --ocr easyocr --gpu
+# easyocr>=1.7
