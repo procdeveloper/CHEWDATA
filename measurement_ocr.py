@@ -535,18 +535,22 @@ class Field:
 
 
 _NUMBER_RE = re.compile(r'-?\d*\.?\d+')
+_TIME_RE = re.compile(r'^\d{1,2}:\d{2}(:\d{2})?$')
 
 
 def clean_number(text: str) -> str:
     """Reduce one OCR token to a valid number string, or '' if it can't be one.
     OCR often tacks on junk that, logged verbatim, turns a numeric column into
     text and taints it in Excel (breaks sorting/formulas). Examples fixed:
-    trailing dot '221.61.' -> '221.61', leading dot '.08' -> '.08' (a valid
-    float), a lone '-' or '' -> '' (dropped). Tokens containing ':' are left
-    as-is so time-style displays (12:34) aren't truncated to a number."""
+    trailing dot '221.61.' -> '221.61', trailing colon '221.61:' -> '221.61',
+    leading dot '.08' -> '.08' (a valid float), a lone '-' or '' -> '' (dropped).
+    Only a strict clock pattern (12:34 / 1:02:03) is passed through untouched --
+    a stray ':' on a number is stripped, not treated as a time."""
     text = text.strip()
-    if not text or ":" in text:
-        return text if ":" in text else ""
+    if not text:
+        return ""
+    if _TIME_RE.match(text):
+        return text
     m = _NUMBER_RE.search(text)
     if not m:
         return ""

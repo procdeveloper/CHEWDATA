@@ -133,17 +133,22 @@ class TestCleanNumber(unittest.TestCase):
     numeric column in Excel."""
 
     def test_strips_trailing_and_leading_junk(self):
-        self.assertEqual(m.clean_number("221.61."), "221.61")   # the reported bug
+        self.assertEqual(m.clean_number("221.61."), "221.61")   # trailing dot
+        self.assertEqual(m.clean_number("221.61:"), "221.61")   # trailing colon
         self.assertEqual(m.clean_number("221."), "221")
         self.assertEqual(m.clean_number(".08"), ".08")
         self.assertEqual(m.clean_number("221.."), "221")
 
     def test_non_numbers_become_blank(self):
-        for junk in ("", "  ", "-", ".", "..", "abc"):
+        for junk in ("", "  ", "-", ".", "..", "abc", ":"):
             self.assertEqual(m.clean_number(junk), "")
 
-    def test_time_like_passthrough(self):
-        self.assertEqual(m.clean_number("12:34"), "12:34")
+    def test_only_strict_clock_passes_through(self):
+        self.assertEqual(m.clean_number("12:34"), "12:34")       # real time
+        self.assertEqual(m.clean_number("1:02:03"), "1:02:03")   # h:mm:ss
+        # a stray colon on a number is NOT a time -> stripped to the number
+        self.assertEqual(m.clean_number("221.61:"), "221.61")
+        self.assertEqual(m.clean_number("221:61"), "221")        # 3-digit, not h:mm
 
     def test_every_clean_result_parses_as_float(self):
         for tok in ("221.61.", ".08", "221.", "-7", "0.007", "11.980", "1.2.3"):
