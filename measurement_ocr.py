@@ -1054,6 +1054,58 @@ def stable_columns(fields: List[Field], layout: dict) -> Tuple[List[str], List[s
     return names, values
 
 
+def _median(xs: List[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _despike(names: List[str], values: List[str], store: dict,
+             window: int = 15, rel_tol: float = 0.5,
+             min_samples: int = 5, floor: float = 1.0) -> List[str]:
+    """Reject a per-column reading that deviates from that column's rolling
+    median by more than `rel_tol` (a fraction of the median), holding the last
+    accepted value instead. This catches OCR misreads like a dropped leading
+    digit (a steady 11.96 column briefly reading 1.96 or 0.96) without touching
+    normal fluctuation. Columns whose median is near zero (|median| < floor)
+    are left unfiltered, so a genuinely small/variable reading (e.g. an angle
+    hovering around 0) isn't clamped. Only accepted values enter the history,
+    so one bad frame can't drag the median."""
+    out: List[str] = []
+    for name, v in zip(names, values):
+        try:
+            val = float(v)
+        except (TypeError, ValueError):
+            out.append(v)          # blanks / non-numbers pass through, untracked
+            continue
+        rec = store.setdefault(name, {"hist": [], "last": v})
+        hist = rec["hist"]
+        if len(hist) >= min_samples:
+            med = _median(hist)
+            if abs(med) >= floor and abs(val - med) > rel_tol * abs(med):
+                out.append(rec["last"])   # outlier -> hold last good value
+                continue
+        hist.append(val)
+        if len(hist) > window:
+            hist.pop(0)
+        rec["last"] = v
+        out.append(v)
+    return out
+
+
+def compute_columns(fields: List[Field], log_state: dict) -> Tuple[List[str], List[str]]:
+    """The values to log for this frame: stable spatial columns, then (when
+    --despike is on) per-column outlier rejection. Called once per logging
+    decision so the despike history advances exactly one sample per frame."""
+    names, values = stable_columns(fields, log_state.setdefault("layout", {}))
+    if log_state.get("despike_on"):
+        values = _despike(names, values, log_state.setdefault("despike", {}))
+    return names, values
+
+
 def _as_number(cell):
     """Coerce numeric-looking strings to real numbers so Excel treats them as
     values, not text. Non-numeric strings pass through; blanks become empty."""
@@ -1148,12 +1200,10 @@ def build_row_logger(path: str) -> RowLogger:
     return CsvLogger(str(path))
 
 
-def log_row(logger: RowLogger, fields: List[Field], cap, frame_idx: int,
-            log_state: dict) -> None:
-    if not fields:
-        print("No fields defined yet -- nothing to log.")
+def log_row(logger: RowLogger, names: List[str], values: List[str], cap,
+            frame_idx: int, log_state: dict) -> None:
+    if not names:
         return
-    names, values = stable_columns(fields, log_state.setdefault("layout", {}))
 
     # Lock the column layout on the first row (or adopt the header of a file
     # we're appending to) so every later row lines up under the same columns.
@@ -1205,13 +1255,13 @@ def maybe_auto_log(ctx: dict) -> None:
     if not fields:
         return
     log_state = ctx['log_state']
-    names, values = stable_columns(fields, log_state.setdefault("layout", {}))
+    names, values = compute_columns(fields, log_state)
     if all(v is None or str(v).strip() == "" for v in values):
         return  # nothing recognized yet -- don't log a blank leading row
     # Re-log if the readings changed OR the column layout changed.
     if values == log_state.get("last_values") and names == log_state.get("last_names"):
         return
-    log_row(ctx['logger'], fields, ctx['cap'], ctx['frame_idx'], log_state)
+    log_row(ctx['logger'], names, values, ctx['cap'], ctx['frame_idx'], log_state)
 
 
 # --------------------------------------------------------------------------
@@ -1265,11 +1315,12 @@ def apply_action(action: str, ctx: dict) -> bool:
         ctx['fields'].clear()
         ctx['dirty'] = True
     elif action == 'log':
-        had_fields = bool(ctx['fields'])
-        log_row(ctx['logger'], ctx['fields'], ctx['cap'],
-                 ctx['frame_idx'], ctx['log_state'])
-        if had_fields:
-            names, values = stable_columns(ctx['fields'], ctx['log_state'].setdefault("layout", {}))
+        if not ctx['fields']:
+            print("No fields defined yet -- nothing to log.")
+        else:
+            names, values = compute_columns(ctx['fields'], ctx['log_state'])
+            log_row(ctx['logger'], names, values, ctx['cap'],
+                     ctx['frame_idx'], ctx['log_state'])
             summary = ", ".join(f"{n}={v or '?'}" for n, v in zip(names, values))
             ctx['flash_text'] = f"Logged: {summary}"
             ctx['flash_until'] = time.time() + 1.5
@@ -1334,6 +1385,12 @@ def parse_args():
                          "number. By default (numeric mode) a token like '221.61.' is "
                          "cleaned to '221.61' and un-numeric junk is dropped, so a stray "
                          "reading can't taint a numeric column in Excel.")
+    p.add_argument("--despike", action="store_true",
+                    help="Reject a per-column reading that jumps far from that column's "
+                         "recent median (holding the last good value), to filter sporadic "
+                         "OCR misreads such as a dropped leading digit (a steady 11.96 "
+                         "column briefly reading 1.96). Off by default since it can also "
+                         "suppress a genuine large jump; recommended for steady readings.")
     p.add_argument("--grid", default=None, metavar="RxC",
                     help="Pre-populate a grid of fields over the display, e.g. --grid 3x4 "
                          "for 3 rows by 4 columns. Each cell becomes its own named column "
@@ -1404,7 +1461,7 @@ def main():
         sys.exit(1)
     # header_written / columns are established lazily on the first logged row
     # (adopting an existing file's header if we're appending to one).
-    log_state: dict = {}
+    log_state: dict = {"despike_on": args.despike}
 
     cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Rectified", cv2.WINDOW_NORMAL)

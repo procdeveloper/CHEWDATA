@@ -150,6 +150,15 @@ containing `:` are left alone so time-style displays aren't mangled. This is
 skipped automatically if you allow letters (`--whitelist ""`) so labels
 survive, and can be turned off with `--no-clean-numbers`.
 
+**Steady-reading spike filter (`--despike`):** OCR on segmented displays
+occasionally drops a leading digit, so a column that reads a steady `11.96`
+briefly shows `1.96` or `0.96`. With `--despike`, each column keeps a rolling
+median and rejects a value that jumps more than ~50% away from it, holding the
+last good value instead. Columns whose median sits near zero (e.g. an angle
+around 0) are left unfiltered so genuine small variation survives. It's off by
+default because it can also suppress a *real* large jump — turn it on when the
+quantity you're reading is expected to be steady.
+
 **Excel output:** give `--output` a `.xlsx` path and it writes an Excel
 workbook instead of CSV (numbers stored as real numeric cells). Needs
 `openpyxl` (`pip install openpyxl`):
@@ -183,6 +192,7 @@ you quit before anything is recognized, the CSV stays empty — that's the
 | `--whitelist STR` | characters OCR may output (default: digits `. - :`); pass `--whitelist ""` to also read letters, e.g. label text like `U-rms(V)` |
 | `--grid RxC` | pre-populate a grid of fields, e.g. `--grid 3x4` (3 rows × 4 cols). Each cell is its own labeled column (`r1c1`, `r1c2`, …); drag cell corners to fit and press `n` to rename — the clean way to get structured columns from a multi-value panel |
 | `--no-clean-numbers` | log OCR text verbatim instead of normalizing it to a valid number (see below) |
+| `--despike` | reject a per-column reading that jumps far from that column's recent median (holding the last good value) — filters sporadic OCR misreads like a dropped leading digit (a steady `11.96` briefly read as `1.96`). Off by default; recommended for steady readings |
 | `--max-width N` | downscale incoming frames to this width for speed (default: 1280, 0 = off) |
 | `--smoothing F` | 0–0.97, jitter damping on the tracked homography (default: 0.6) |
 | `--sharpness-window N` | pick the sharpest of the last N frames before OCR when stacking is off (default: 5) |

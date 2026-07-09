@@ -163,6 +163,43 @@ class TestCleanNumber(unittest.TestCase):
         self.assertFalse(m._numeric_mode(ns("0123abcXYZ")))
 
 
+class TestDespike(unittest.TestCase):
+    """Per-column outlier rejection for OCR misreads (e.g. a dropped leading
+    digit turning a steady 11.96 into 1.96)."""
+
+    def _run(self, seq, store=None):
+        store = store if store is not None else {}
+        return [m._despike(["c"], [v], store)[0] for v in seq], store
+
+    def test_dropped_digit_spike_is_held(self):
+        # steady ~11.96 column with a sporadic 1.96 / 0.96 misread
+        seq = ["11.96", "11.97", "11.96", "11.95", "11.96",  # warm up (5)
+               "1.96",   # <- misread, should be rejected
+               "11.96",
+               "0.96"]   # <- misread, should be rejected
+        out, _ = self._run(seq)
+        self.assertEqual(out[5], "11.96")   # held last good, not 1.96
+        self.assertEqual(out[7], "11.96")   # held last good, not 0.96
+        # real values passed through untouched
+        self.assertEqual(out[:5], seq[:5])
+        self.assertEqual(out[6], "11.96")
+
+    def test_warmup_values_pass_through(self):
+        # before min_samples we can't judge outliers, so nothing is filtered
+        out, _ = self._run(["1.9", "11.9", "0.9"])
+        self.assertEqual(out, ["1.9", "11.9", "0.9"])
+
+    def test_near_zero_column_not_filtered(self):
+        # an angle-style column around 0 must keep its genuine variation
+        seq = ["0.00", "0.00", "0.25", "0.00", "0.10", "0.25", "0.02", "0.28"]
+        out, _ = self._run(seq)
+        self.assertEqual(out, seq)   # nothing held: |median| < floor
+
+    def test_non_numbers_pass_through(self):
+        out, _ = self._run(["", "11.9", "", "12.0"])
+        self.assertEqual(out, ["", "11.9", "", "12.0"])
+
+
 class TestStableColumns(unittest.TestCase):
     """A number must always land in the same column, whatever order OCR
     returns the tokens in and even if some are dropped -- the regression that
@@ -296,11 +333,10 @@ class TestOutputRobustness(unittest.TestCase):
             m.build_row_logger(d)   # path is a directory, cannot be opened as a file
 
     def test_log_row_survives_a_locked_output(self):
-        f = m.Field(name="v", rect=(0, 0, 10, 10),
-                    last_tokens=["12.3"], last_boxes=[(0, 0, 5, 5)])
         log_state = {}
         # Must NOT raise, even though every append() fails.
-        m.log_row(_RaisingLogger(), [f], _FakeCap(), frame_idx=1, log_state=log_state)
+        m.log_row(_RaisingLogger(), ["v"], ["12.3"], _FakeCap(),
+                  frame_idx=1, log_state=log_state)
         self.assertEqual(log_state.get("rows_logged", 0), 0)  # nothing counted as written
         self.assertTrue(log_state.get("warned_write"))        # warned once
 
