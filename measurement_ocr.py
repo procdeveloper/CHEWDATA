@@ -80,10 +80,11 @@ USAGE
 
 import argparse
 import csv
+import os
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -380,8 +381,28 @@ class OcrBackend:
         raise NotImplementedError
 
 
+def _ensure_tesseract_cmd(pytesseract) -> None:
+    """pytesseract calls the bare `tesseract` command, which fails if the
+    binary is installed but not on PATH (common on Windows). If it's not
+    resolvable, fall back to the usual install locations."""
+    import os
+    import shutil
+    if shutil.which(pytesseract.pytesseract.tesseract_cmd):
+        return
+    for cand in (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        "/opt/homebrew/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        "/usr/bin/tesseract",
+    ):
+        if os.path.exists(cand):
+            pytesseract.pytesseract.tesseract_cmd = cand
+            return
+
+
 class TesseractBackend(OcrBackend):
-    def __init__(self, whitelist: str = "0123456789.-:"):
+    def __init__(self, whitelist: str = "0123456789.-:", psm: int = 11):
         try:
             import pytesseract
         except ImportError as e:
@@ -390,7 +411,13 @@ class TesseractBackend(OcrBackend):
                 "install the Tesseract binary for your OS (see the header "
                 "of this script).") from e
         self.pytesseract = pytesseract
-        self.config = f'--psm 7 -c tessedit_char_whitelist={whitelist}'
+        _ensure_tesseract_cmd(pytesseract)
+        # PSM 11 ("sparse text") finds numbers scattered across a multi-value
+        # panel; PSM 7 ("single line") returns *nothing* on a multi-row
+        # display, which is what produced empty CSVs. An empty whitelist lets
+        # letters through too (e.g. to also read parameter-name labels).
+        wl = f' -c tessedit_char_whitelist={whitelist}' if whitelist else ''
+        self.config = f'--psm {psm}{wl}'
 
     def recognize(self, image):
         data = self.pytesseract.image_to_data(
@@ -421,7 +448,7 @@ class EasyOcrBackend(OcrBackend):
         self.allowlist = allowlist
 
     def recognize(self, image):
-        out = self.reader.readtext(image, allowlist=self.allowlist)
+        out = self.reader.readtext(image, allowlist=self.allowlist or None)
         results = []
         for box, text, conf in out:
             xs, ys = [p[0] for p in box], [p[1] for p in box]
@@ -435,8 +462,8 @@ class EasyOcrBackend(OcrBackend):
 
 def build_ocr_backend(args) -> OcrBackend:
     if args.ocr == "easyocr":
-        return EasyOcrBackend(gpu=args.gpu)
-    return TesseractBackend()
+        return EasyOcrBackend(gpu=args.gpu, allowlist=args.whitelist)
+    return TesseractBackend(whitelist=args.whitelist, psm=args.psm)
 
 
 # --------------------------------------------------------------------------
@@ -490,6 +517,13 @@ class Field:
     rect: Tuple[int, int, int, int]     # x, y, w, h in canonical/rectified coords
     last_text: str = ""
     last_conf: float = 0.0
+    # Bounding boxes of the recognized value pieces, in canonical/rectified
+    # coords (mapped back from the upscaled OCR image). Drawn in red.
+    last_boxes: List[Tuple[int, int, int, int]] = dataclass_field(default_factory=list)
+    # The recognized text of each value piece, index-aligned with last_boxes.
+    # A field may hold several (e.g. the whole-panel field over a table); these
+    # get split into one-number-per-column at log time via field_columns().
+    last_tokens: List[str] = dataclass_field(default_factory=list)
 
 
 def run_ocr_and_update_fields(ocr_source: np.ndarray, fields: List[Field],
@@ -518,6 +552,14 @@ def run_ocr_and_update_fields(ocr_source: np.ndarray, fields: List[Field],
             results.sort(key=lambda r: r[0][0])  # left to right
             f.last_text = " ".join(r[1] for r in results)
             f.last_conf = float(np.mean([r[2] for r in results]))
+            # Map each value box from upscaled-crop space back to canonical
+            # coords: undo the OCR upscale, then offset by the field origin.
+            up = args.upscale if args.upscale else 1.0
+            f.last_boxes = [
+                (int(x + bx / up), int(y + by / up), int(bw / up), int(bh / up))
+                for (bx, by, bw, bh), _text, _conf in results
+            ]
+            f.last_tokens = [text for _box, text, _conf in results]
 
 
 # --------------------------------------------------------------------------
@@ -539,6 +581,12 @@ def draw_original_overlay(frame: np.ndarray, quad_in_frame: np.ndarray,
     cv2.putText(frame, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
 
+# Overlay colors (BGR). Purple outlines the parameter regions; red outlines
+# the recognized value boxes inside them.
+PARAM_COLOR = (200, 0, 140)   # purple
+VALUE_COLOR = (0, 0, 255)     # red
+
+
 def draw_rectified_overlay(img: np.ndarray, fields: List[Field], mouse_state: dict) -> None:
     if mouse_state.get("dragging") and mouse_state.get("start") and mouse_state.get("cur"):
         p1 = tuple(int(v) for v in mouse_state["start"])
@@ -546,10 +594,14 @@ def draw_rectified_overlay(img: np.ndarray, fields: List[Field], mouse_state: di
         cv2.rectangle(img, p1, p2, (255, 255, 0), 1)
     for f in fields:
         x, y, w, h = f.rect
-        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 200, 255), 2)
+        # Purple box around the parameter region the user/OCR found...
+        cv2.rectangle(img, (x, y), (x + w, y + h), PARAM_COLOR, 2)
+        # ...and a red box around each recognized value piece inside it.
+        for (vx, vy, vw, vh) in f.last_boxes:
+            cv2.rectangle(img, (vx, vy), (vx + vw, vy + vh), VALUE_COLOR, 1)
         label = f"{f.name}: {f.last_text}  ({f.last_conf:.2f})"
         cv2.putText(img, label, (x, max(15, y - 6)), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (0, 200, 255), 1, cv2.LINE_AA)
+                    0.5, PARAM_COLOR, 1, cv2.LINE_AA)
 
 
 # --------------------------------------------------------------------------
@@ -732,17 +784,188 @@ def make_composite_mouse_callback(state: dict, scale_ref: List[float], image_h_r
 # CSV logging
 # --------------------------------------------------------------------------
 
-def log_row(writer, csv_file, fields: List[Field], cap, frame_idx: int, log_state: dict) -> None:
+def _row_major_tokens(tokens: List[str],
+                      boxes: List[Tuple[int, int, int, int]]) -> List[str]:
+    """Order (token, box) pairs into natural reading order -- top-to-bottom by
+    row, left-to-right within a row -- so a table reads the way a person would.
+    Falls back to the input order if boxes are missing or don't line up."""
+    if not boxes or len(boxes) != len(tokens):
+        return list(tokens)
+    heights = sorted(h for (_x, _y, _w, h) in boxes)
+    med_h = heights[len(heights) // 2] or 1
+    row_tol = max(1.0, med_h * 0.6)
+    order = sorted(range(len(tokens)),
+                   key=lambda i: (round(boxes[i][1] / row_tol), boxes[i][0]))
+    return [tokens[i] for i in order]
+
+
+def field_columns(fields: List[Field]) -> Tuple[List[str], List[str]]:
+    """Flatten fields into parallel (names, values) lists with ONE number per
+    column. A field that recognized several numbers (e.g. the whole-panel field
+    over a multi-value display) is split into name_1, name_2, ... in reading
+    order; a single-value field stays one column under its own name."""
+    names: List[str] = []
+    values: List[str] = []
+    for f in fields:
+        toks = _row_major_tokens(f.last_tokens, f.last_boxes)
+        if len(toks) <= 1:
+            names.append(f.name)
+            values.append(toks[0] if toks else f.last_text)
+        else:
+            for i, t in enumerate(toks, 1):
+                names.append(f"{f.name}_{i}")
+                values.append(t)
+    return names, values
+
+
+def _as_number(cell):
+    """Coerce numeric-looking strings to real numbers so Excel treats them as
+    values, not text. Non-numeric strings pass through; blanks become empty."""
+    if cell is None or cell == "":
+        return None
+    if isinstance(cell, (int, float)):
+        return cell
+    s = str(cell)
+    try:
+        f = float(s)
+    except ValueError:
+        return s
+    return int(f) if f.is_integer() and "." not in s and "e" not in s.lower() else f
+
+
+class RowLogger:
+    """Append-only tabular sink; CSV and XLSX share this interface so the
+    logging code above doesn't care which format is in use."""
+    def existing_header(self) -> Optional[List]:
+        return None
+
+    def append(self, cells: List) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class CsvLogger(RowLogger):
+    def __init__(self, path: str):
+        self._path = path
+        self._file = open(path, "a", newline="")
+        self._writer = csv.writer(self._file)
+
+    def existing_header(self):
+        if not (os.path.exists(self._path) and os.path.getsize(self._path) > 0):
+            return None
+        with open(self._path, newline="") as fh:
+            return next(csv.reader(fh), None)
+
+    def append(self, cells):
+        self._writer.writerow(cells)
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+
+class XlsxLogger(RowLogger):
+    def __init__(self, path: str):
+        import openpyxl
+        self._path = path
+        self._had_data = os.path.exists(path) and os.path.getsize(path) > 0
+        if self._had_data:
+            self._wb = openpyxl.load_workbook(path)
+            self._ws = self._wb.active
+        else:
+            self._wb = openpyxl.Workbook()
+            self._ws = self._wb.active
+            self._ws.title = "readings"
+        self._save()
+
+    def existing_header(self):
+        # Only read row 1 when the file actually had data -- touching self._ws[1]
+        # on a fresh sheet would materialize an empty row and shift the header.
+        if not self._had_data or self._ws.max_row < 1:
+            return None
+        row = [c.value for c in self._ws[1]]
+        return row if any(v is not None for v in row) else None
+
+    def append(self, cells):
+        self._ws.append([_as_number(c) for c in cells])
+        self._save()
+
+    def _save(self):
+        self._wb.save(self._path)
+
+    def close(self):
+        self._save()
+
+
+def build_row_logger(path: str) -> RowLogger:
+    """Pick a logger from the output extension: .xlsx -> Excel, else CSV."""
+    if str(path).lower().endswith((".xlsx", ".xlsm")):
+        try:
+            import openpyxl  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "Writing .xlsx needs openpyxl. `pip install openpyxl`, "
+                "or use a .csv --output path instead.") from e
+        return XlsxLogger(str(path))
+    return CsvLogger(str(path))
+
+
+def log_row(logger: RowLogger, fields: List[Field], cap, frame_idx: int,
+            log_state: dict) -> None:
     if not fields:
         print("No fields defined yet -- nothing to log.")
         return
+    names, values = field_columns(fields)
+
+    # Lock the column layout on the first row (or adopt the header of a file
+    # we're appending to) so every later row lines up under the same columns.
+    columns = log_state.get("columns")
+    if columns is None:
+        existing = logger.existing_header()
+        if existing:
+            columns = [str(c) for c in existing[2:]]  # drop timestamp_s, frame_idx
+            log_state["header_written"] = True
+        else:
+            columns = names
+        log_state["columns"] = columns
     if not log_state.get("header_written"):
-        writer.writerow(["timestamp_s", "frame_idx"] + [f.name for f in fields])
+        logger.append(["timestamp_s", "frame_idx"] + columns)
         log_state["header_written"] = True
+
+    # Align this row to the locked columns by name (missing -> blank, extras
+    # dropped) so a frame that reads a different count doesn't shift the table.
+    by_name: dict = {}
+    for n, v in zip(names, values):
+        by_name.setdefault(n, v)
+    row_values = [by_name.get(col, "") for col in columns]
+
     ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-    writer.writerow([f"{ts:.3f}", frame_idx] + [f.last_text for f in fields])
-    csv_file.flush()
-    print("Logged:", {f.name: f.last_text for f in fields})
+    logger.append([f"{ts:.3f}", frame_idx] + row_values)
+    # Dedupe key is the raw expansion, so auto-log fires only on real changes.
+    log_state["last_values"] = values
+    log_state["last_names"] = names
+    log_state["rows_logged"] = log_state.get("rows_logged", 0) + 1
+    print("Logged:", dict(zip(columns, row_values)))
+
+
+def maybe_auto_log(ctx: dict) -> None:
+    """Write a row automatically when the set of readings has changed since the
+    last logged row (manual or automatic). Skips blank readings and unchanged
+    ones so a played-through clip yields one row per distinct reading rather
+    than a row per frame or an empty file."""
+    fields = ctx['fields']
+    if not fields:
+        return
+    names, values = field_columns(fields)
+    if all(v is None or str(v).strip() == "" for v in values):
+        return  # nothing recognized yet -- don't log a blank leading row
+    log_state = ctx['log_state']
+    # Re-log if the readings changed OR the column layout changed.
+    if values == log_state.get("last_values") and names == log_state.get("last_names"):
+        return
+    log_row(ctx['logger'], fields, ctx['cap'], ctx['frame_idx'], log_state)
 
 
 # --------------------------------------------------------------------------
@@ -795,10 +1018,11 @@ def apply_action(action: str, ctx: dict) -> bool:
         ctx['dirty'] = True
     elif action == 'log':
         had_fields = bool(ctx['fields'])
-        log_row(ctx['csv_writer'], ctx['csv_file'], ctx['fields'], ctx['cap'],
+        log_row(ctx['logger'], ctx['fields'], ctx['cap'],
                  ctx['frame_idx'], ctx['log_state'])
         if had_fields:
-            summary = ", ".join(f"{f.name}={f.last_text or '?'}" for f in ctx['fields'])
+            names, values = field_columns(ctx['fields'])
+            summary = ", ".join(f"{n}={v or '?'}" for n, v in zip(names, values))
             ctx['flash_text'] = f"Logged: {summary}"
             ctx['flash_until'] = time.time() + 1.5
     elif action == 'rebase':
@@ -838,13 +1062,24 @@ def parse_args():
     p.add_argument("--gpu", action="store_true",
                     help="Use GPU for the easyocr backend (ignored for tesseract)")
     p.add_argument("--output", default="extracted_data.csv",
-                    help="CSV file to append logged readings to (default: extracted_data.csv)")
+                    help="File to append logged readings to. A .xlsx path writes an Excel "
+                         "workbook (needs openpyxl); any other extension writes CSV "
+                         "(default: extracted_data.csv)")
     p.add_argument("--ocr-every", dest="ocr_every", type=int, default=5,
                     help="Run OCR every N frames while playing (default: 5)")
     p.add_argument("--upscale", type=float, default=3.0,
                     help="Upscale factor applied before OCR (default: 3.0)")
     p.add_argument("--no-auto-invert", action="store_true",
                     help="Disable automatic light/dark polarity detection before OCR")
+    p.add_argument("--psm", type=int, default=11,
+                    help="Tesseract page-segmentation mode (default: 11 = sparse text, "
+                         "reads numbers scattered across a multi-value panel). Use 7 for a "
+                         "single tightly-cropped value, 6 for a uniform text block. "
+                         "(Ignored by the easyocr backend.)")
+    p.add_argument("--whitelist", default="0123456789.-:",
+                    help="Characters OCR is allowed to output (default: digits plus . - :). "
+                         "Pass an empty string (--whitelist \"\") to also capture letters, "
+                         "e.g. parameter-name labels like 'U-rms(V)'.")
     p.add_argument("--max-width", type=int, default=1280,
                     help="Downscale incoming frames to this width for speed (default: 1280, 0=off)")
     p.add_argument("--smoothing", type=float, default=0.6,
@@ -864,6 +1099,11 @@ def parse_args():
     p.add_argument("--no-rebase-on-recovery", action="store_true",
                     help="Don't auto-adopt a fresh reference frame right after recovering "
                          "from a tracking loss")
+    p.add_argument("--no-auto-log", action="store_true",
+                    help="Disable automatic logging. By default a row is written to the "
+                         "CSV whenever a field's reading changes, so playing a clip through "
+                         "captures every distinct reading with no key presses. With this "
+                         "flag, rows are only written when you press 'e'/Log.")
     return p.parse_args()
 
 
@@ -904,10 +1144,16 @@ def main():
         cv2.destroyAllWindows()
         sys.exit(1)
 
-    csv_path = Path(args.output)
-    csv_file = open(csv_path, "a", newline="")
-    csv_writer = csv.writer(csv_file)
-    log_state = {"header_written": csv_path.exists() and csv_path.stat().st_size > 0}
+    try:
+        logger = build_row_logger(args.output)
+    except RuntimeError as e:
+        print(f"Output error: {e}")
+        cap.release()
+        cv2.destroyAllWindows()
+        sys.exit(1)
+    # header_written / columns are established lazily on the first logged row
+    # (adopting an existing file's header if we're appending to one).
+    log_state: dict = {}
 
     sharpness_window = max(1, args.sharpness_window)
     stack_frames = max(1, args.stack_frames)
@@ -923,8 +1169,9 @@ def main():
         'args': args, 'cap': cap, 'tracker': tracker, 'fields': [],
         'paused': False, 'frame_idx': 0, 'ocr_every': max(1, args.ocr_every),
         'quality_buf': deque(maxlen=max(sharpness_window, stack_frames, 1)),
-        'dirty': True, 'frame': frame, 'csv_writer': csv_writer, 'csv_file': csv_file,
+        'dirty': True, 'frame': frame, 'logger': logger,
         'log_state': log_state, 'flash_text': None, 'flash_until': 0.0,
+        'auto_log': not args.no_auto_log,
         'scale_ref': scale_ref, 'image_h_ref': image_h_ref, 'buttons_ref': buttons_ref,
     }
     refresh_display_params(ctx)
@@ -971,6 +1218,8 @@ def main():
                 ocr_source = rectified  # buffer still empty on the very first frame(s)
             run_ocr_and_update_fields(ocr_source, ctx['fields'], backend, args)
             ctx['dirty'] = False
+            if ctx['auto_log']:
+                maybe_auto_log(ctx)
 
         # ---- "Original" window: tracked outline + stats HUD + flash banner ----
         display_frame = frame.copy()
@@ -989,6 +1238,7 @@ def main():
             f"Sharpness: {cur_sharpness:6.0f}",
             f"OCR every {ctx['ocr_every']}f | {ocr_mode}",
             f"Fields: {len(ctx['fields'])}   Frame: {ctx['frame_idx']}",
+            f"Rows logged: {ctx['log_state'].get('rows_logged', 0)}",
         ]
         draw_stats_panel(display_frame, stats_lines)
         if ctx['flash_text'] and time.time() < ctx['flash_until']:
@@ -1043,9 +1293,9 @@ def main():
                 ctx['dirty'] = True
 
     cap.release()
-    csv_file.close()
+    logger.close()
     cv2.destroyAllWindows()
-    print(f"Data saved to {csv_path.resolve()}")
+    print(f"Data saved to {Path(args.output).resolve()}")
 
 
 if __name__ == "__main__":

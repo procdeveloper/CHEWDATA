@@ -122,12 +122,35 @@ displays, not required to get started.
 
 ### Output
 
-Appends rows to `extracted_data.csv` (or `--output <path>`):
+Appends rows to `extracted_data.csv` (or `--output <path>`). **One number per
+column:** each field is its own column, and if a single field (e.g. the
+whole-panel default) reads several numbers they're split into `name_1`,
+`name_2`, … in reading order (top-to-bottom, left-to-right):
 
 ```
 timestamp_s,frame_idx,field1,field2
 12.480,374,12.34,0.55
 ```
+
+**Excel output:** give `--output` a `.xlsx` path and it writes an Excel
+workbook instead of CSV (numbers stored as real numeric cells). Needs
+`openpyxl` (`pip install openpyxl`):
+
+```bash
+python measurement_ocr.py video.mp4 --output readings.xlsx
+```
+
+The column layout is locked on the first logged row (and adopted from an
+existing file's header when appending), so every row stays aligned even if a
+frame happens to read a different number of values.
+
+**Rows are written automatically whenever a reading changes** — so just
+playing a clip through captures every distinct reading without touching the
+keyboard, and a stable reading isn't re-logged frame after frame. Press
+`e`/Log any time to force an extra row (e.g. to capture a reading that
+didn't change). Pass `--no-auto-log` to go back to manual-only logging. If
+you quit before anything is recognized, the CSV stays empty — that's the
+"nothing was read" case, not a bug.
 
 ## Useful flags
 
@@ -138,12 +161,15 @@ timestamp_s,frame_idx,field1,field2
 | `--ocr-every N` | run OCR every N frames while playing (default: 5) |
 | `--upscale F` | upscale factor before OCR, useful for tiny digits (default: 3.0) |
 | `--no-auto-invert` | disable automatic dark/light polarity correction |
+| `--psm N` | Tesseract page-segmentation mode (default: 11 = sparse text, reads a whole multi-value panel; 7 = a single tightly-cropped value) |
+| `--whitelist STR` | characters OCR may output (default: digits `. - :`); pass `--whitelist ""` to also read letters, e.g. label text like `U-rms(V)` |
 | `--max-width N` | downscale incoming frames to this width for speed (default: 1280, 0 = off) |
 | `--smoothing F` | 0–0.97, jitter damping on the tracked homography (default: 0.6) |
 | `--sharpness-window N` | pick the sharpest of the last N frames before OCR when stacking is off (default: 5) |
 | `--stack-frames N` | median-stack the last N aligned frames before OCR; 1 disables stacking (default: 3) |
 | `--rebase-after-weak N` | adopt a fresh reference after N consecutive weak-match frames; 0 disables (default: 20) |
 | `--no-rebase-on-recovery` | don't adopt a fresh reference right after recovering from a tracking loss |
+| `--no-auto-log` | disable automatic logging; only write a CSV row when you press `e`/Log (auto-logging on every reading change is the default) |
 
 ## Tips for accuracy
 

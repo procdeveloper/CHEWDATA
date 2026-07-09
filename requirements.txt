@@ -1,7 +1,8 @@
 opencv-python>=4.8
 numpy>=1.24
 pytesseract>=0.3.10
+openpyxl>=3.1        # only needed if you use an .xlsx --output path
 
 # Optional GPU-capable / alternative OCR backend (no external binary needed,
 # but pulls in PyTorch — heavier install). Enable with: --ocr easyocr --gpu
-# easyocr>=1.7
+easyocr>=1.7
