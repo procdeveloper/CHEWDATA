@@ -81,6 +81,7 @@ USAGE
 import argparse
 import csv
 import os
+import re
 import sys
 import time
 from collections import deque
@@ -532,6 +533,38 @@ class Field:
     last_tokens: List[str] = dataclass_field(default_factory=list)
 
 
+_NUMBER_RE = re.compile(r'-?\d*\.?\d+')
+
+
+def clean_number(text: str) -> str:
+    """Reduce one OCR token to a valid number string, or '' if it can't be one.
+    OCR often tacks on junk that, logged verbatim, turns a numeric column into
+    text and taints it in Excel (breaks sorting/formulas). Examples fixed:
+    trailing dot '221.61.' -> '221.61', leading dot '.08' -> '.08' (a valid
+    float), a lone '-' or '' -> '' (dropped). Tokens containing ':' are left
+    as-is so time-style displays (12:34) aren't truncated to a number."""
+    text = text.strip()
+    if not text or ":" in text:
+        return text if ":" in text else ""
+    m = _NUMBER_RE.search(text)
+    if not m:
+        return ""
+    s = m.group(0)
+    try:
+        float(s)
+    except ValueError:
+        return ""
+    return s
+
+
+def _numeric_mode(args) -> bool:
+    """True when readings are expected to be numbers (the whitelist restricts
+    to digits/punctuation). If letters are allowed -- e.g. --whitelist "" to
+    capture label text -- number-cleaning is off so labels survive."""
+    wl = args.whitelist
+    return bool(wl) and not any(c.isalpha() for c in wl)
+
+
 def run_ocr_and_update_fields(ocr_source: np.ndarray, fields: List[Field],
                                backend: OcrBackend, args) -> None:
     """If no fields were defined yet, auto-creates one covering the whole
@@ -556,16 +589,24 @@ def run_ocr_and_update_fields(ocr_source: np.ndarray, fields: List[Field],
             results = []
         if results:
             results.sort(key=lambda r: r[0][0])  # left to right
-            f.last_text = " ".join(r[1] for r in results)
-            f.last_conf = float(np.mean([r[2] for r in results]))
             # Map each value box from upscaled-crop space back to canonical
             # coords: undo the OCR upscale, then offset by the field origin.
+            # In numeric mode, normalize each token to a real number and drop
+            # anything that isn't one, so junk never taints a numeric column.
             up = args.upscale if args.upscale else 1.0
-            f.last_boxes = [
-                (int(x + bx / up), int(y + by / up), int(bw / up), int(bh / up))
-                for (bx, by, bw, bh), _text, _conf in results
-            ]
-            f.last_tokens = [text for _box, text, _conf in results]
+            clean = _numeric_mode(args) and not args.no_clean_numbers
+            kept = []
+            for (bx, by, bw, bh), text, conf in results:
+                tok = clean_number(text) if clean else text
+                if not tok:
+                    continue
+                box = (int(x + bx / up), int(y + by / up), int(bw / up), int(bh / up))
+                kept.append((box, tok, conf))
+            if kept:  # leave the last good reading untouched if all were junk
+                f.last_boxes = [b for b, _t, _c in kept]
+                f.last_tokens = [t for _b, t, _c in kept]
+                f.last_text = " ".join(t for _b, t, _c in kept)
+                f.last_conf = float(np.mean([c for _b, _t, c in kept]))
 
 
 def parse_grid_spec(spec: str) -> Tuple[int, int]:
@@ -1282,6 +1323,11 @@ def parse_args():
                     help="Characters OCR is allowed to output (default: digits plus . - :). "
                          "Pass an empty string (--whitelist \"\") to also capture letters, "
                          "e.g. parameter-name labels like 'U-rms(V)'.")
+    p.add_argument("--no-clean-numbers", action="store_true",
+                    help="Log OCR text verbatim instead of normalizing it to a valid "
+                         "number. By default (numeric mode) a token like '221.61.' is "
+                         "cleaned to '221.61' and un-numeric junk is dropped, so a stray "
+                         "reading can't taint a numeric column in Excel.")
     p.add_argument("--grid", default=None, metavar="RxC",
                     help="Pre-populate a grid of fields over the display, e.g. --grid 3x4 "
                          "for 3 rows by 4 columns. Each cell becomes its own named column "

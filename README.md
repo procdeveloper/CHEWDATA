@@ -140,6 +140,14 @@ timestamp_s,frame_idx,field1,field2
 12.480,374,12.34,0.55
 ```
 
+**Clean numbers only:** in numeric mode (the default digit whitelist), every
+logged value is normalized to a real number so it can't taint a numeric
+column in Excel — a stray `221.61.` is cleaned to `221.61`, and un-numeric
+junk (a lone `-`, empty reads) is dropped rather than logged as text. Values
+containing `:` are left alone so time-style displays aren't mangled. This is
+skipped automatically if you allow letters (`--whitelist ""`) so labels
+survive, and can be turned off with `--no-clean-numbers`.
+
 **Excel output:** give `--output` a `.xlsx` path and it writes an Excel
 workbook instead of CSV (numbers stored as real numeric cells). Needs
 `openpyxl` (`pip install openpyxl`):
@@ -172,6 +180,7 @@ you quit before anything is recognized, the CSV stays empty — that's the
 | `--psm N` | Tesseract page-segmentation mode (default: 11 = sparse text, reads a whole multi-value panel; 7 = a single tightly-cropped value) |
 | `--whitelist STR` | characters OCR may output (default: digits `. - :`); pass `--whitelist ""` to also read letters, e.g. label text like `U-rms(V)` |
 | `--grid RxC` | pre-populate a grid of fields, e.g. `--grid 3x4` (3 rows × 4 cols). Each cell is its own labeled column (`r1c1`, `r1c2`, …); drag cell corners to fit and press `n` to rename — the clean way to get structured columns from a multi-value panel |
+| `--no-clean-numbers` | log OCR text verbatim instead of normalizing it to a valid number (see below) |
 | `--max-width N` | downscale incoming frames to this width for speed (default: 1280, 0 = off) |
 | `--smoothing F` | 0–0.97, jitter damping on the tracked homography (default: 0.6) |
 | `--sharpness-window N` | pick the sharpest of the last N frames before OCR when stacking is off (default: 5) |

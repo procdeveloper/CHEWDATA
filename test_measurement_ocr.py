@@ -128,6 +128,36 @@ class TestFieldColumns(unittest.TestCase):
         self.assertEqual(values, [""])
 
 
+class TestCleanNumber(unittest.TestCase):
+    """Every logged value must be a real number (or blank) so it can't taint a
+    numeric column in Excel."""
+
+    def test_strips_trailing_and_leading_junk(self):
+        self.assertEqual(m.clean_number("221.61."), "221.61")   # the reported bug
+        self.assertEqual(m.clean_number("221."), "221")
+        self.assertEqual(m.clean_number(".08"), ".08")
+        self.assertEqual(m.clean_number("221.."), "221")
+
+    def test_non_numbers_become_blank(self):
+        for junk in ("", "  ", "-", ".", "..", "abc"):
+            self.assertEqual(m.clean_number(junk), "")
+
+    def test_time_like_passthrough(self):
+        self.assertEqual(m.clean_number("12:34"), "12:34")
+
+    def test_every_clean_result_parses_as_float(self):
+        for tok in ("221.61.", ".08", "221.", "-7", "0.007", "11.980", "1.2.3"):
+            r = m.clean_number(tok)
+            self.assertNotEqual(r, "")
+            float(r)  # must not raise
+
+    def test_numeric_mode_detects_letters(self):
+        ns = lambda wl: __import__("types").SimpleNamespace(whitelist=wl)
+        self.assertTrue(m._numeric_mode(ns("0123456789.-:")))
+        self.assertFalse(m._numeric_mode(ns("")))          # wants raw text
+        self.assertFalse(m._numeric_mode(ns("0123abcXYZ")))
+
+
 class TestStableColumns(unittest.TestCase):
     """A number must always land in the same column, whatever order OCR
     returns the tokens in and even if some are dropped -- the regression that
