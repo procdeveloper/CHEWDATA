@@ -109,13 +109,19 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return ordered
 
 
+CANONICAL_MAX = 6000  # hard cap so a mis-dragged / degenerate quad can't ask
+                      # warpPerspective to allocate a giant rectified image
+
+
 def canonical_size_from_quad(quad: np.ndarray) -> Tuple[int, int]:
     """Pick an output (width, height) for the rectified image based on the
-    real proportions of the quad the user selected."""
+    real proportions of the quad the user selected. Clamped to sane bounds so
+    a degenerate or far-dragged selection can't produce a 0-size or absurdly
+    huge canvas (the latter would crash warpPerspective on allocation)."""
     tl, tr, br, bl = quad
     w = int(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
     h = int(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))
-    return max(w, 60), max(h, 40)
+    return min(max(w, 60), CANONICAL_MAX), min(max(h, 40), CANONICAL_MAX)
 
 
 def auto_detect_quad(frame: np.ndarray) -> Optional[np.ndarray]:
@@ -562,6 +568,34 @@ def run_ocr_and_update_fields(ocr_source: np.ndarray, fields: List[Field],
             f.last_tokens = [text for _box, text, _conf in results]
 
 
+def parse_grid_spec(spec: str) -> Tuple[int, int]:
+    """Parse a '<rows>x<cols>' grid spec (also accepts X, * or , as the
+    separator) into (rows, cols). Raises ValueError on anything malformed."""
+    for sep in ("x", "X", "*", ","):
+        if sep in spec:
+            a, b = spec.split(sep, 1)
+            rows, cols = int(a), int(b)
+            if rows < 1 or cols < 1:
+                raise ValueError("grid rows and cols must both be >= 1")
+            return rows, cols
+    raise ValueError("grid must look like RxC, e.g. 3x4")
+
+
+def build_grid_fields(rows: int, cols: int, width: int, height: int) -> List[Field]:
+    """Evenly tile the canonical display with rows*cols fields named r1c1,
+    r1c2, ... (row-major). Each becomes its own stable, labeled column; the
+    user can drag any cell's corner to fit it and rename it with 'n'."""
+    fields: List[Field] = []
+    for r in range(rows):
+        y0 = int(round(r * height / rows))
+        y1 = int(round((r + 1) * height / rows))
+        for c in range(cols):
+            x0 = int(round(c * width / cols))
+            x1 = int(round((c + 1) * width / cols))
+            fields.append(Field(name=f"r{r + 1}c{c + 1}", rect=(x0, y0, x1 - x0, y1 - y0)))
+    return fields
+
+
 # --------------------------------------------------------------------------
 # Drawing
 # --------------------------------------------------------------------------
@@ -596,6 +630,9 @@ def draw_rectified_overlay(img: np.ndarray, fields: List[Field], mouse_state: di
         x, y, w, h = f.rect
         # Purple box around the parameter region the user/OCR found...
         cv2.rectangle(img, (x, y), (x + w, y + h), PARAM_COLOR, 2)
+        # ...small purple corner handles you can grab to resize the field...
+        for (hx, hy) in ((x, y), (x + w, y), (x, y + h), (x + w, y + h)):
+            cv2.rectangle(img, (hx - 3, hy - 3), (hx + 3, hy + 3), PARAM_COLOR, -1)
         # ...and a red box around each recognized value piece inside it.
         for (vx, vy, vw, vh) in f.last_boxes:
             cv2.rectangle(img, (vx, vy), (vx + vw, vy + vh), VALUE_COLOR, 1)
@@ -716,27 +753,52 @@ def draw_flash_banner(frame: np.ndarray, text: str) -> None:
 # --------------------------------------------------------------------------
 
 def select_corners_interactively(frame: np.ndarray, window: str = "Original") -> Optional[np.ndarray]:
-    print("Click the 4 corners of the display (any order). "
-          "Press 'a' to auto-detect, 'q' to cancel.")
-    pts: List[Tuple[int, int]] = []
+    print("Click to drop the 4 display corners, then drag any corner to fine-tune. "
+          "Press Enter to confirm, 'a' to auto-detect, 'q' to cancel.")
+    pts: List[List[int]] = []
+    drag = {"idx": None}
+    handle_r = 8
+
+    def nearest_corner(x, y):
+        best, best_d = None, (handle_r * 2) ** 2
+        for i, (px, py) in enumerate(pts):
+            d = (px - x) ** 2 + (py - y) ** 2
+            if d <= best_d:
+                best, best_d = i, d
+        return best
 
     def on_mouse(event, x, y, flags, userdata):
-        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
-            pts.append((x, y))
+        if event == cv2.EVENT_LBUTTONDOWN:
+            i = nearest_corner(x, y)
+            if i is not None:
+                drag["idx"] = i                 # grab an existing corner to move it
+            elif len(pts) < 4:
+                pts.append([x, y])              # or drop the next new corner
+                drag["idx"] = len(pts) - 1
+        elif event == cv2.EVENT_MOUSEMOVE and drag["idx"] is not None:
+            pts[drag["idx"]] = [x, y]
+        elif event == cv2.EVENT_LBUTTONUP:
+            drag["idx"] = None
 
     cv2.setMouseCallback(window, on_mouse)
     while True:
         display = frame.copy()
-        for p in pts:
-            cv2.circle(display, p, 5, (0, 255, 0), -1)
-        if len(pts) == 4:
-            cv2.polylines(display, [np.array(pts, dtype=np.int32)], True, (0, 255, 0), 2)
+        if len(pts) >= 2:
+            cv2.polylines(display, [np.array(pts, dtype=np.int32)],
+                          len(pts) == 4, (0, 255, 0), 2)
+        for i, p in enumerate(pts):
+            cv2.circle(display, tuple(p), handle_r, (0, 255, 0), 2)
+            cv2.circle(display, tuple(p), 2, (0, 255, 0), -1)
+            cv2.putText(display, str(i + 1), (p[0] + 10, p[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        hint = ("Enter=confirm  drag corners to adjust  a=auto  q=cancel"
+                if len(pts) == 4 else f"Click corner {len(pts) + 1} of 4  (a=auto, q=cancel)")
+        cv2.putText(display, hint, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.imshow(window, display)
         key = cv2.waitKey(20) & 0xFF
 
-        if len(pts) == 4:
-            cv2.imshow(window, display)
-            cv2.waitKey(250)
+        if key in (13, 10) and len(pts) == 4:   # Enter / Return confirms
             return order_points(np.array(pts, dtype=np.float32))
         if key == ord('a'):
             quad = auto_detect_quad(frame)
@@ -747,15 +809,45 @@ def select_corners_interactively(frame: np.ndarray, window: str = "Original") ->
             return None
 
 
+def _grab_field_corner(fields: List[Field], cx: float, cy: float, tol: float):
+    """If (cx, cy) is within `tol` of any field's corner, return
+    (field, anchor_x, anchor_y) where the anchor is the diagonally-opposite
+    corner (held fixed while the grabbed corner is dragged). Nearest wins."""
+    best = None
+    best_d = tol * tol
+    for f in fields:
+        x, y, w, h = f.rect
+        # (grabbed corner) -> (opposite/anchor corner)
+        for gx, gy, ax, ay in ((x, y, x + w, y + h),
+                               (x + w, y, x, y + h),
+                               (x, y + h, x + w, y),
+                               (x + w, y + h, x, y)):
+            d = (gx - cx) ** 2 + (gy - cy) ** 2
+            if d <= best_d:
+                best_d = d
+                best = (f, ax, ay)
+    return best
+
+
 def make_composite_mouse_callback(state: dict, scale_ref: List[float], image_h_ref: List[int],
-                                   buttons_ref: List[List[Button]]):
+                                   buttons_ref: List[List[Button]],
+                                   fields_ref: List[List[Field]], canon_ref: List[int]):
     """One callback serves the whole "Rectified" window: clicks below
     `image_h_ref[0]` (the toolbar strip) are hit-tested against the current
-    button layout; clicks above it are field-drag gestures, converted back
-    from on-screen display pixels to canonical coordinates via
-    `scale_ref[0]` so field rects stay correct regardless of display zoom.
-    Cell-style (single-element list) refs let the layout change (e.g. after
-    a re-pick) without re-registering the callback."""
+    button layout; clicks above it are field gestures, converted back from
+    on-screen display pixels to canonical coordinates via `scale_ref[0]` so
+    field rects stay correct regardless of display zoom. Grabbing near an
+    existing field's corner *edits* that field (drag to resize); a drag on
+    empty space *creates* a new field. Cell-style (single-element list) refs
+    let the layout change (e.g. after a re-pick) without re-registering."""
+    def _clamp(v, hi):
+        return max(0.0, min(float(hi), v))
+
+    def _end_gesture():
+        state["dragging"] = False
+        state["edit_field"] = None
+        state["edit_anchor"] = None
+
     def on_mouse(event, x, y, flags, userdata):
         image_h = image_h_ref[0]
         if y >= image_h:
@@ -765,18 +857,39 @@ def make_composite_mouse_callback(state: dict, scale_ref: List[float], image_h_r
                     state["button_cmd"] = cmd
                     state["flash_cmd"] = cmd
                     state["flash_button_until"] = time.time() + 0.25
+            elif event == cv2.EVENT_LBUTTONUP:
+                _end_gesture()   # a drag that ends over the toolbar still ends cleanly
             return
         scale = scale_ref[0] or 1.0
         cx, cy = x / scale, y / scale
+        cw, ch = canon_ref[0], canon_ref[1]
+
         if event == cv2.EVENT_LBUTTONDOWN:
-            state["dragging"] = True
-            state["start"] = (cx, cy)
-            state["cur"] = (cx, cy)
-        elif event == cv2.EVENT_MOUSEMOVE and state.get("dragging"):
-            state["cur"] = (cx, cy)
-        elif event == cv2.EVENT_LBUTTONUP and state.get("dragging"):
-            state["dragging"] = False
-            state["completed_rect"] = (state["start"][0], state["start"][1], cx, cy)
+            grab = _grab_field_corner(fields_ref[0], cx, cy, tol=max(6.0, 12.0 / scale))
+            if grab is not None:
+                f, ax, ay = grab
+                state["edit_field"] = f
+                state["edit_anchor"] = (ax, ay)
+            else:
+                state["dragging"] = True
+                state["start"] = (cx, cy)
+                state["cur"] = (cx, cy)
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if state.get("edit_field") is not None:
+                ax, ay = state["edit_anchor"]
+                nx, ny = _clamp(cx, cw), _clamp(cy, ch)
+                f = state["edit_field"]
+                f.rect = (int(min(ax, nx)), int(min(ay, ny)),
+                          int(abs(nx - ax)), int(abs(ny - ay)))
+            elif state.get("dragging"):
+                state["cur"] = (cx, cy)
+        elif event == cv2.EVENT_LBUTTONUP:
+            if state.get("edit_field") is not None:
+                state["edit_field"] = None
+                state["edit_anchor"] = None
+            elif state.get("dragging"):
+                state["dragging"] = False
+                state["completed_rect"] = (state["start"][0], state["start"][1], cx, cy)
     return on_mouse
 
 
@@ -930,10 +1043,6 @@ def log_row(logger: RowLogger, fields: List[Field], cap, frame_idx: int,
         else:
             columns = names
         log_state["columns"] = columns
-    if not log_state.get("header_written"):
-        logger.append(["timestamp_s", "frame_idx"] + columns)
-        log_state["header_written"] = True
-
     # Align this row to the locked columns by name (missing -> blank, extras
     # dropped) so a frame that reads a different count doesn't shift the table.
     by_name: dict = {}
@@ -942,7 +1051,21 @@ def log_row(logger: RowLogger, fields: List[Field], cap, frame_idx: int,
     row_values = [by_name.get(col, "") for col in columns]
 
     ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-    logger.append([f"{ts:.3f}", frame_idx] + row_values)
+    try:
+        if not log_state.get("header_written"):
+            logger.append(["timestamp_s", "frame_idx"] + columns)
+            log_state["header_written"] = True
+        logger.append([f"{ts:.3f}", frame_idx] + row_values)
+    except OSError as e:
+        # e.g. the user opened the output in Excel mid-run and it's now locked.
+        # Drop the row rather than crash; warn once so it isn't silent.
+        if not log_state.get("warned_write"):
+            print(f"Warning: could not write to the output file ({e}). "
+                  "Is it open in another program? Rows are being dropped until "
+                  "it's closed.")
+            log_state["warned_write"] = True
+        return
+    log_state["warned_write"] = False
     # Dedupe key is the raw expansion, so auto-log fires only on real changes.
     log_state["last_values"] = values
     log_state["last_names"] = names
@@ -1004,6 +1127,8 @@ def refresh_display_params(ctx: dict) -> None:
     ctx['scale_ref'][0] = scale
     ctx['image_h_ref'][0] = disp_h
     ctx['buttons_ref'][0] = build_toolbar_buttons(disp_w)
+    ctx['canon_ref'][0] = ctx['tracker'].canonical_w
+    ctx['canon_ref'][1] = ctx['tracker'].canonical_h
     ctx['disp_w'], ctx['disp_h'] = disp_w, disp_h
 
 
@@ -1080,6 +1205,11 @@ def parse_args():
                     help="Characters OCR is allowed to output (default: digits plus . - :). "
                          "Pass an empty string (--whitelist \"\") to also capture letters, "
                          "e.g. parameter-name labels like 'U-rms(V)'.")
+    p.add_argument("--grid", default=None, metavar="RxC",
+                    help="Pre-populate a grid of fields over the display, e.g. --grid 3x4 "
+                         "for 3 rows by 4 columns. Each cell becomes its own named column "
+                         "(r1c1, r1c2, ...) that you can drag to fit and rename. Best for "
+                         "structured multi-value panels; drag any cell corner to adjust it.")
     p.add_argument("--max-width", type=int, default=1280,
                     help="Downscale incoming frames to this width for speed (default: 1280, 0=off)")
     p.add_argument("--smoothing", type=float, default=0.6,
@@ -1121,39 +1251,66 @@ def main():
         sys.exit(1)
     frame = resize_max_width(frame, args.max_width)
 
-    cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Rectified", cv2.WINDOW_NORMAL)
-
-    quad = select_corners_interactively(frame)
-    if quad is None:
-        print("No quadrilateral selected -- exiting.")
-        cap.release()
-        cv2.destroyAllWindows()
-        sys.exit(0)
-
-    canonical_size = canonical_size_from_quad(quad)
-    tracker = ReferenceTracker(frame, quad, canonical_size, smoothing=args.smoothing,
-                                rebase_after_weak=args.rebase_after_weak,
-                                rebase_on_recovery=not args.no_rebase_on_recovery)
-
+    # Preflight the OCR backend and the output file BEFORE the user picks
+    # corners, so a missing backend or a locked/read-only output (e.g. the CSV
+    # is open in Excel) fails immediately instead of after all that work.
     try:
         backend = build_ocr_backend(args)
     except RuntimeError as e:
         print(f"OCR backend error: {e}")
         cap.release()
-        cv2.destroyAllWindows()
         sys.exit(1)
 
     try:
         logger = build_row_logger(args.output)
-    except RuntimeError as e:
-        print(f"Output error: {e}")
+    except (RuntimeError, OSError) as e:
+        print(f"Cannot open output file {args.output!r}: {e}")
+        if isinstance(e, PermissionError):
+            print("It's most likely open in Excel or another program -- close it, "
+                  "or pass --output <other.csv> / a .xlsx path.")
         cap.release()
-        cv2.destroyAllWindows()
         sys.exit(1)
     # header_written / columns are established lazily on the first logged row
     # (adopting an existing file's header if we're appending to one).
     log_state: dict = {}
+
+    cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Rectified", cv2.WINDOW_NORMAL)
+
+    # Loop so a selection that can't be turned into a usable tracker (too
+    # little texture, or a degenerate/collinear quad) re-prompts instead of
+    # crashing on confirm -- mirrors the guarded re-pick ('r') path.
+    tracker = None
+    while tracker is None:
+        quad = select_corners_interactively(frame)
+        if quad is None:
+            print("No quadrilateral selected -- exiting.")
+            logger.close()
+            cap.release()
+            cv2.destroyAllWindows()
+            sys.exit(0)
+        try:
+            canonical_size = canonical_size_from_quad(quad)
+            tracker = ReferenceTracker(frame, quad, canonical_size, smoothing=args.smoothing,
+                                        rebase_after_weak=args.rebase_after_weak,
+                                        rebase_on_recovery=not args.no_rebase_on_recovery)
+        except (RuntimeError, cv2.error, MemoryError, ValueError) as e:
+            print(f"That selection didn't work ({e}). Please pick the 4 corners again.")
+            tracker = None
+
+    initial_fields: List[Field] = []
+    if args.grid:
+        try:
+            grid_rows, grid_cols = parse_grid_spec(args.grid)
+        except ValueError as e:
+            print(f"Bad --grid value {args.grid!r}: {e}")
+            cap.release()
+            cv2.destroyAllWindows()
+            sys.exit(1)
+        initial_fields = build_grid_fields(grid_rows, grid_cols,
+                                           tracker.canonical_w, tracker.canonical_h)
+        print(f"Created a {grid_rows}x{grid_cols} grid of {len(initial_fields)} fields "
+              "-- drag any cell corner to fit it, press 'n' to rename the last one.")
 
     sharpness_window = max(1, args.sharpness_window)
     stack_frames = max(1, args.stack_frames)
@@ -1162,17 +1319,21 @@ def main():
     scale_ref: List[float] = [1.0]
     image_h_ref: List[int] = [0]
     buttons_ref: List[List[Button]] = [[]]
+    fields_ref: List[List[Field]] = [initial_fields]
+    canon_ref: List[int] = [tracker.canonical_w, tracker.canonical_h]
     cv2.setMouseCallback("Rectified",
-                         make_composite_mouse_callback(mouse_state, scale_ref, image_h_ref, buttons_ref))
+                         make_composite_mouse_callback(mouse_state, scale_ref, image_h_ref,
+                                                       buttons_ref, fields_ref, canon_ref))
 
     ctx = {
-        'args': args, 'cap': cap, 'tracker': tracker, 'fields': [],
+        'args': args, 'cap': cap, 'tracker': tracker, 'fields': initial_fields,
         'paused': False, 'frame_idx': 0, 'ocr_every': max(1, args.ocr_every),
         'quality_buf': deque(maxlen=max(sharpness_window, stack_frames, 1)),
         'dirty': True, 'frame': frame, 'logger': logger,
         'log_state': log_state, 'flash_text': None, 'flash_until': 0.0,
         'auto_log': not args.no_auto_log,
         'scale_ref': scale_ref, 'image_h_ref': image_h_ref, 'buttons_ref': buttons_ref,
+        'canon_ref': canon_ref,
     }
     refresh_display_params(ctx)
 

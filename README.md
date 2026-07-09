@@ -10,7 +10,8 @@ optional GPU OCR backend.
 Rather than doing generic whole-frame video stabilization, this tracks the
 one thing that matters: the display panel itself.
 
-1. On the first frame, you click its 4 corners (or auto-detect).
+1. On the first frame, you click its 4 corners (or auto-detect). You can
+   **drag any corner to fine-tune it**, then press **Enter** to confirm.
 2. Every later frame is matched **directly against that first frame** using
    ORB features + a RANSAC homography — not frame-to-frame. Matching
    against one fixed reference means there's no drift to accumulate, no
@@ -109,6 +110,7 @@ the keyboard. Logging also flashes a green on-screen confirmation banner
 |---|---|---|
 | `space` | Pause/Play | pause / resume |
 | click or drag (on **Rectified**) | — | define a numeric field. A quick click drops a default-size box there; a drag lets you size it exactly — handy for multi-value displays (e.g. voltage *and* current) |
+| drag a field's **corner handle** | — | resize/adjust a field *after* placing it — grab any of the four purple corner squares and drag. Works on grid cells too, so you can nudge them onto the real values |
 | `n` | — | rename the most recently added field (typed in the terminal; no button, since it needs typed text) |
 | `c` | Clear | clear all fields |
 | `e` | Log | **extract**: log the current reading of every field, with a timestamp, to the CSV |
@@ -163,6 +165,7 @@ you quit before anything is recognized, the CSV stays empty — that's the
 | `--no-auto-invert` | disable automatic dark/light polarity correction |
 | `--psm N` | Tesseract page-segmentation mode (default: 11 = sparse text, reads a whole multi-value panel; 7 = a single tightly-cropped value) |
 | `--whitelist STR` | characters OCR may output (default: digits `. - :`); pass `--whitelist ""` to also read letters, e.g. label text like `U-rms(V)` |
+| `--grid RxC` | pre-populate a grid of fields, e.g. `--grid 3x4` (3 rows × 4 cols). Each cell is its own labeled column (`r1c1`, `r1c2`, …); drag cell corners to fit and press `n` to rename — the clean way to get structured columns from a multi-value panel |
 | `--max-width N` | downscale incoming frames to this width for speed (default: 1280, 0 = off) |
 | `--smoothing F` | 0–0.97, jitter damping on the tracked homography (default: 0.6) |
 | `--sharpness-window N` | pick the sharpest of the last N frames before OCR when stacking is off (default: 5) |
